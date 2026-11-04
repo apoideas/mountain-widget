@@ -1,0 +1,1537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Topography</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    cursor: default;
+  }
+  canvas:focus { outline: none; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const GOLD = "rgb(244, 220, 106)";
+  const INK = "#1b1408";
+  // A chosen hill keeps a bright outer rim and quieter inner rings. Hills left
+  // out stay readable, only dimmer. A click on empty black clears the choice
+  // and paints every hill halfway between those two.
+  const INNER_ALPHA = 0.62;
+  const FADED_ALPHA = 0.45;
+  const IDLE_ALPHA = (FADED_ALPHA + 1) * 0.5;
+  const SELECT_STEM = "rgba(244,220,106,0.92)";
+  const FADED_STEM = "rgba(244,220,106,0.62)";
+  const IDLE_STEM = "rgba(244,220,106,0.81)";
+  const MIN_V = 0.05;
+  const MAX_V = 0.80;
+  const SENS = 0.0024;
+  const CLICK = 5;
+  // A new peak is born at this size and eases to FULL over GROW_MS.
+  const BIRTH = 0.08;
+  const FULL = 0.30;
+  const GROW_MS = 2000;
+  // Second press within this time and distance is a double-click or double-tap.
+  const DBL_MS = 500;
+  const DBL_PX = 22;
+  // The average summit stays at least this far inside the window.
+  const PAN_MARGIN = 80;
+  // Release speed is an end-weighted fit, so speeding up into the let-go
+  // wobbles more and slowing down wobbles less. The cap keeps a flick gentle.
+  const SETTLE_GAIN = 0.09;
+  const SETTLE_MAX = 0.18;
+  const SETTLE_MIN = 0.02;
+  const SETTLE_TAU = 0.42;
+  const SETTLE_HZ = 2.8;
+  const SETTLE_MS = 1100;
+  const REST_REACH = 1.42;
+  const SETTLE_REACH = 2.15;
+
+  // Default framing matches the stills. Pitch is measured up from the
+  // horizontal; zoom multiplies the base scale. Vertical gain keeps the
+  // default pitch identical to the old fixed oblique camera.
+  const CAM = {
+    scale: 1.52,
+    compress: 0.33,
+    zFactor: 0.64,
+    anchorY: 0.755,
+  };
+  const PITCH_MIN = 0;
+  const PITCH_MAX = Math.PI / 2;
+  const ZOOM_MIN = 0.38;
+  const ZOOM_MAX = 2.6;
+  const PITCH0 = Math.asin(CAM.compress);
+  const V_GAIN = CAM.zFactor / Math.cos(PITCH0);
+  const YAW_SENS = 0.0065;
+  const PITCH_SENS = 0.0052;
+
+  // Handle metrics at u = min(viewport) / 1000, which is ~1 on the stills.
+  const UI = {
+    dotR: 6.5,
+    triW: 16,
+    triH: 13,
+    fontPx: 22,
+    textLift: 326,
+    triGap: 36,
+    dotGap: 34,
+    stemGap: 16,
+    belowBase: 70,
+    tickStart: 8,
+    tickEnd: 36,
+    pillPadX: 18,
+    pillH: 46,
+    pillR: 12,
+    colHalf: 22,
+    rowHalf: 22,
+    bodyPx: 13,
+    summitPx: 16,
+  };
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: false });
+
+  const state = {
+    peaks: [],
+    activeId: 1,
+    nextId: 2,
+    selected: new Set(),
+    picked: true,
+    hoverLabel: null,
+    geomDirty: true,
+  };
+
+  let cssW = 1;
+  let cssH = 1;
+  let cache = null;
+  let pointer = null;
+  let raf = 0;
+  let liveFrame = 0;
+  let settle = null;
+  let settleFrame = 0;
+  const fingers = new Map();
+  const cam = { yaw: 0, pitch: PITCH0, zoom: 1, panX: 0, panY: 0 };
+  let lastTap = null;
+
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  function format2(v) {
+    const n = Math.round(v * 100) / 100;
+    return (Math.abs(n) < 0.005 ? 0 : n).toFixed(2);
+  }
+
+  function addPeak(x, y, amplitude, radius, phase, phase2) {
+    const peak = {
+      id: state.nextId++,
+      x, y,
+      amplitude: amplitude == null ? 0.30 : amplitude,
+      radius: radius == null ? 0.30 : radius,
+      phase: phase == null ? Math.random() * Math.PI * 2 : phase,
+      phase2: phase2 == null ? Math.random() * Math.PI * 2 : phase2,
+    };
+    state.peaks.push(peak);
+    state.activeId = peak.id;
+    state.selected.clear();
+    state.picked = true;
+    state.geomDirty = true;
+    return peak;
+  }
+
+  // The opening peak. Phases are fixed so the apron wobble is stable.
+  state.peaks.push({
+    id: 1, x: 0, y: 0,
+    amplitude: 0.30, radius: 0.30,
+    phase: 0.85, phase2: 2.35,
+  });
+
+  function activePeak() {
+    for (const p of state.peaks) if (p.id === state.activeId) return p;
+    state.activeId = state.peaks[0].id;
+    return state.peaks[0];
+  }
+
+  function peakById(id) {
+    for (const p of state.peaks) if (p.id === id) return p;
+    return state.peaks[0];
+  }
+
+  function view() {
+    const u = Math.max(0.55, Math.min(1.8, Math.min(cssW, cssH) / 1000));
+    const s = Math.min(cssW, cssH) * CAM.scale * cam.zoom;
+    const sp = Math.sin(cam.pitch);
+    const cp = Math.cos(cam.pitch);
+    return {
+      u, s,
+      vCompress: sp,
+      zScale: s * cp * V_GAIN,
+      cx: cssW * 0.5 + cam.panX,
+      cy: cssH * CAM.anchorY + cam.panY,
+      yaw: cam.yaw,
+      pitch: cam.pitch,
+      zoom: cam.zoom,
+      sinPitch: sp,
+      cosYaw: Math.cos(cam.yaw),
+      sinYaw: Math.sin(cam.yaw),
+    };
+  }
+
+  function project(x, y, z, v) {
+    const x1 = x * v.cosYaw - y * v.sinYaw;
+    const y1 = x * v.sinYaw + y * v.cosYaw;
+    return {
+      x: v.cx + x1 * v.s,
+      y: v.cy - y1 * v.s * v.sinPitch - z * v.zScale,
+    };
+  }
+
+  function unproject(sx, sy, v) {
+    const x1 = (sx - v.cx) / v.s;
+    const y1 = -(sy - v.cy) / (v.s * Math.max(v.sinPitch, 1e-3));
+    return {
+      x: x1 * v.cosYaw + y1 * v.sinYaw,
+      y: -x1 * v.sinYaw + y1 * v.cosYaw,
+    };
+  }
+
+  function settling(peak) {
+    return settle != null && settle.ids.has(peak.id);
+  }
+
+  function settleWave() {
+    if (!settle) return 0;
+    const t = (settle.now - settle.t0) / 1000;
+    if (!(t > 0)) return 0;
+    return settle.amp * Math.exp(-t / SETTLE_TAU) * Math.sin(t * SETTLE_HZ * Math.PI * 2);
+  }
+
+  function wobble(theta, peak) {
+    const p = peak.phase;
+    const q = peak.phase2;
+    let w = 1
+      + 0.100 * Math.sin(2 * theta + p)
+      + 0.068 * Math.sin(3 * theta + q)
+      + 0.030 * Math.sin(5 * theta + p * 1.7 + 0.6)
+      + 0.016 * Math.sin(7 * theta + q * 1.3 + 1.4);
+    if (w < 0.62) w = 0.62;
+    if (w > 1.38) w = 1.38;
+    if (settling(peak)) {
+      w += settleWave() * Math.cos(theta - settle.dir);
+      if (w < 0.24) w = 0.24;
+      if (w > 1.80) w = 1.80;
+    }
+    return w;
+  }
+
+  function contribution(peak, x, y) {
+    const dx = x - peak.x;
+    const dy = y - peak.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 === 0) return peak.amplitude;
+    const rMax = peak.radius * (settling(peak) ? SETTLE_REACH : REST_REACH);
+    if (d2 >= rMax * rMax) return 0;
+    const r = peak.radius * wobble(Math.atan2(dy, dx), peak);
+    const t = Math.sqrt(d2) / r;
+    if (t >= 1) return 0;
+    // Raised cosine keeps the rim soft. A cubic cone sharpens the tip so the
+    // stack reads as a cone instead of a flat dome. Both are 1 at the center
+    // and 0, with zero slope, at the rim.
+    const cosine = 0.5 * (1 + Math.cos(Math.PI * t));
+    const cone = (1 - t) * (1 - t * t);
+    return peak.amplitude * (0.55 * cosine + 0.45 * cone);
+  }
+
+  function sample(x, y) {
+    let h = 0;
+    for (let i = 0; i < state.peaks.length; i++) h += contribution(state.peaks[i], x, y);
+    return h;
+  }
+
+  function smoothClosed(pts) {
+    let cur = pts;
+    for (let pass = 0; pass < 2; pass++) {
+      const n = cur.length;
+      const next = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = cur[(i - 1 + n) % n];
+        const b = cur[i];
+        const c = cur[(i + 1) % n];
+        next[i] = [(a[0] + 2 * b[0] + c[0]) * 0.25, (a[1] + 2 * b[1] + c[1]) * 0.25];
+      }
+      cur = next;
+    }
+    return cur;
+  }
+
+  function traceLevel(field, cols, rows, level) {
+    const hStride = cols - 1;
+    const hCount = hStride * rows;
+    const vmap = new Map();
+    const gx = [];
+    const gy = [];
+    const segA = [];
+    const segB = [];
+
+    function vid(i, j, edge) {
+      let key;
+      if (edge === 0) key = j * hStride + i;
+      else if (edge === 2) key = (j + 1) * hStride + i;
+      else if (edge === 1) key = hCount + j * cols + (i + 1);
+      else key = hCount + j * cols + i;
+      let id = vmap.get(key);
+      if (id === undefined) {
+        id = gx.length;
+        vmap.set(key, id);
+        let i0, j0, i1, j1;
+        if (edge === 0) { i0 = i; j0 = j; i1 = i + 1; j1 = j; }
+        else if (edge === 1) { i0 = i + 1; j0 = j; i1 = i + 1; j1 = j + 1; }
+        else if (edge === 2) { i0 = i; j0 = j + 1; i1 = i + 1; j1 = j + 1; }
+        else { i0 = i; j0 = j; i1 = i; j1 = j + 1; }
+        const v0 = field[j0 * cols + i0];
+        const v1 = field[j1 * cols + i1];
+        let t = (level - v0) / (v1 - v0);
+        if (!(t >= 0 && t <= 1)) t = t < 0 ? 0 : 1;
+        gx.push(i0 + (i1 - i0) * t);
+        gy.push(j0 + (j1 - j0) * t);
+      }
+      return id;
+    }
+
+    function add(i, j, e0, e1) {
+      const a = vid(i, j, e0);
+      const b = vid(i, j, e1);
+      if (a !== b) { segA.push(a); segB.push(b); }
+    }
+
+    for (let j = 0; j < rows - 1; j++) {
+      const row = j * cols;
+      const rowB = row + cols;
+      for (let i = 0; i < cols - 1; i++) {
+        const tl = field[row + i];
+        const tr = field[row + i + 1];
+        const br = field[rowB + i + 1];
+        const bl = field[rowB + i];
+        let bits = 0;
+        if (bl >= level) bits |= 1;
+        if (br >= level) bits |= 2;
+        if (tr >= level) bits |= 4;
+        if (tl >= level) bits |= 8;
+        if (bits === 0 || bits === 15) continue;
+        if (bits === 5 || bits === 10) {
+          const center = (tl + tr + br + bl) * 0.25;
+          if (bits === 5) {
+            if (center >= level) { add(i, j, 3, 0); add(i, j, 2, 1); }
+            else { add(i, j, 3, 2); add(i, j, 0, 1); }
+          } else if (center >= level) { add(i, j, 0, 1); add(i, j, 3, 2); }
+          else { add(i, j, 0, 3); add(i, j, 2, 1); }
+        } else if (bits === 1) add(i, j, 3, 2);
+        else if (bits === 2) add(i, j, 2, 1);
+        else if (bits === 3) add(i, j, 3, 1);
+        else if (bits === 4) add(i, j, 1, 0);
+        else if (bits === 6) add(i, j, 2, 0);
+        else if (bits === 7) add(i, j, 3, 0);
+        else if (bits === 8) add(i, j, 0, 3);
+        else if (bits === 9) add(i, j, 0, 2);
+        else if (bits === 11) add(i, j, 0, 1);
+        else if (bits === 12) add(i, j, 1, 3);
+        else if (bits === 13) add(i, j, 1, 2);
+        else if (bits === 14) add(i, j, 2, 3);
+      }
+    }
+
+    const adj = new Map();
+    for (let s = 0; s < segA.length; s++) {
+      const a = segA[s];
+      const b = segB[s];
+      let na = adj.get(a);
+      if (!na) { na = []; adj.set(a, na); }
+      let nb = adj.get(b);
+      if (!nb) { nb = []; adj.set(b, nb); }
+      na.push(b);
+      nb.push(a);
+    }
+
+    const visited = new Set();
+    const loops = [];
+    for (const start of adj.keys()) {
+      if (visited.has(start)) continue;
+      const loop = [start];
+      visited.add(start);
+      let prev = -1;
+      let cur = start;
+      let guard = 0;
+      const limit = gx.length + 5;
+      while (guard++ < limit) {
+        const nbrs = adj.get(cur);
+        let next = null;
+        for (let k = 0; k < nbrs.length; k++) {
+          const n = nbrs[k];
+          if (n !== prev && !visited.has(n)) { next = n; break; }
+        }
+        if (next === null) {
+          for (let k = 0; k < nbrs.length; k++) {
+            const n = nbrs[k];
+            if (n !== prev) { next = n; break; }
+          }
+        }
+        if (next === null || next === start || visited.has(next)) break;
+        visited.add(next);
+        loop.push(next);
+        prev = cur;
+        cur = next;
+      }
+      if (loop.length >= 8) {
+        const pts = new Array(loop.length);
+        for (let k = 0; k < loop.length; k++) pts[k] = [gx[loop[k]], gy[loop[k]]];
+        loops.push(pts);
+      }
+    }
+    return loops;
+  }
+
+  function tagOwners(pts) {
+    const n = pts.length;
+    const ids = new Array(n);
+    const weak = new Array(n);
+    const peaks = state.peaks;
+    for (let i = 0; i < n; i++) {
+      let bestId = peaks[0].id;
+      let bestC = -1;
+      let second = 0;
+      const x = pts[i][0];
+      const y = pts[i][1];
+      for (let p = 0; p < peaks.length; p++) {
+        const c = contribution(peaks[p], x, y);
+        if (c > bestC) { second = bestC; bestC = c; bestId = peaks[p].id; }
+        else if (c > second) second = c;
+      }
+      ids[i] = bestId;
+      weak[i] = bestC - second < 0.01;
+    }
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < n; i++) {
+        if (weak[i]) ids[i] = ids[(i - 1 + n) % n];
+      }
+    }
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = { x: pts[i][0], y: pts[i][1], peakId: ids[i] };
+    return out;
+  }
+
+  function buildContours() {
+    const peaks = state.peaks;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let minR = Infinity;
+    for (let i = 0; i < peaks.length; i++) {
+      const p = peaks[i];
+      const e = p.radius * (settling(p) ? SETTLE_REACH : REST_REACH);
+      if (p.x - e < minX) minX = p.x - e;
+      if (p.x + e > maxX) maxX = p.x + e;
+      if (p.y - e < minY) minY = p.y - e;
+      if (p.y + e > maxY) maxY = p.y + e;
+      if (p.radius < minR) minR = p.radius;
+    }
+    const rangeX = Math.max(1e-4, maxX - minX);
+    const rangeY = Math.max(1e-4, maxY - minY);
+    const cell = Math.min(minR / 46, Math.max(rangeX, rangeY) / 280);
+    let cols = Math.ceil(rangeX / cell) + 1;
+    let rows = Math.ceil(rangeY / cell) + 1;
+    cols = Math.max(280, Math.min(440, cols));
+    rows = Math.max(280, Math.min(440, rows));
+    const dx = rangeX / (cols - 1);
+    const dy = rangeY / (rows - 1);
+    const field = new Float32Array(cols * rows);
+    let maxF = 0;
+    for (let j = 0; j < rows; j++) {
+      const y = minY + j * dy;
+      const row = j * cols;
+      for (let i = 0; i < cols; i++) {
+        let h = 0;
+        const x = minX + i * dx;
+        for (let p = 0; p < peaks.length; p++) h += contribution(peaks[p], x, y);
+        if (h > maxF) maxF = h;
+        // Tiny per-cell bias so a contour never passes exactly through a grid corner.
+        field[row + i] = h > 0 ? h + ((row + i) % 13 + 1) * 1e-8 : 0;
+      }
+    }
+    const levels = [];
+    for (let i = 0; ; i++) {
+      const L = 0.01 + i * 0.02;
+      if (L >= maxF - 1e-4) break;
+      levels.push(L);
+    }
+    const loops = [];
+    for (let li = 0; li < levels.length; li++) {
+      const level = levels[li];
+      const raw = traceLevel(field, cols, rows, level);
+      for (let r = 0; r < raw.length; r++) {
+        const world = new Array(raw[r].length);
+        for (let k = 0; k < raw[r].length; k++) {
+          world[k] = [minX + raw[r][k][0] * dx, minY + raw[r][k][1] * dy];
+        }
+        let per = 0;
+        for (let k = 0; k < world.length; k++) {
+          const a = world[k];
+          const b = world[(k + 1) % world.length];
+          per += Math.hypot(b[0] - a[0], b[1] - a[1]);
+        }
+        if (per < 0.035 || world.length < 8) continue;
+        const smooth = smoothClosed(world);
+        loops.push({ level, points: tagOwners(smooth) });
+      }
+    }
+    return { loops, levels, cols, rows, maxF };
+  }
+
+  function ensureGeom() {
+    if (!state.geomDirty && cache) return cache;
+    cache = buildContours();
+    state.geomDirty = false;
+    return cache;
+  }
+
+  function setFont(v) {
+    const px = Math.max(11, Math.round(UI.fontPx * v.u));
+    ctx.font = `600 ${px}px Inter, "Segoe UI", Helvetica, Arial, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+  }
+
+  function slotWidth(v) {
+    return ctx.measureText("0.00").width + UI.pillPadX * 2 * v.u;
+  }
+
+  function apronBottom(peak, v, geom) {
+    const stemX = project(peak.x, peak.y, 0, v).x;
+    const band = 30 * v.u;
+    let best = -Infinity;
+    let found = false;
+    const loops = geom.loops;
+    for (let i = 0; i < loops.length; i++) {
+      const lp = loops[i];
+      if (lp.level > 0.045) continue;
+      const pts = lp.points;
+      for (let k = 0; k < pts.length; k++) {
+        if (pts[k].peakId !== peak.id) continue;
+        const s = project(pts[k].x, pts[k].y, lp.level, v);
+        if (Math.abs(s.x - stemX) <= band && s.y > best) {
+          best = s.y;
+          found = true;
+        }
+      }
+    }
+    if (found) return best;
+    const rim = peak.radius * 1.15;
+    return project(peak.x, peak.y - rim, 0, v).y;
+  }
+
+  // Summit, stem, and height-handle anchor. Shared by every peak. The width
+  // row is added only for the active peak, which is the one that draws it.
+  function stemAnchor(peak, v) {
+    const u = v.u;
+    const summit = project(peak.x, peak.y, sample(peak.x, peak.y), v);
+    let textY = summit.y - UI.textLift * u;
+    let downY = textY + UI.triGap * u;
+    let upY = textY - UI.triGap * u;
+    let dotY = upY - UI.dotGap * u;
+    // A tall peak would slide the handle off the top. Keep the dot on screen
+    // without pushing the lower triangle down into the summit.
+    const margin = 16 * u;
+    if (dotY < margin) {
+      const room = (summit.y - 10 * u) - (downY + UI.triH * u * 0.5 + UI.stemGap * u);
+      const shift = Math.min(margin - dotY, Math.max(0, room));
+      textY += shift;
+      downY += shift;
+      upY += shift;
+      dotY += shift;
+    }
+    return { summit, textY, downY, upY, dotY, x: summit.x };
+  }
+
+  function layoutOf(peak, v, geom) {
+    const stem = stemAnchor(peak, v);
+    const u = v.u;
+    const bottom = apronBottom(peak, v, geom);
+    return {
+      summit: stem.summit,
+      textY: stem.textY,
+      downY: stem.downY,
+      upY: stem.upY,
+      dotY: stem.dotY,
+      x: stem.x,
+      widthY: bottom + UI.belowBase * u,
+      tickTop: bottom + UI.tickStart * u,
+      tickBot: bottom + UI.belowBase * u - UI.tickEnd * u,
+      bottom,
+    };
+  }
+
+  function distPointSeg(px, py, ax, ay, bx, by) {
+    const abx = bx - ax;
+    const aby = by - ay;
+    const len2 = abx * abx + aby * aby;
+    if (len2 < 1e-8) return Math.hypot(px - ax, py - ay);
+    let t = ((px - ax) * abx + (py - ay) * aby) / len2;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    return Math.hypot(px - (ax + abx * t), py - (ay + aby * t));
+  }
+
+  function hitTest(sx, sy) {
+    const v = view();
+    const geom = ensureGeom();
+    const active = activePeak();
+    const L = layoutOf(active, v, geom);
+    const u = v.u;
+    setFont(v);
+    const slot = slotWidth(v);
+    const labelHW = slot * 0.5 + 6 * u;
+    const labelHH = UI.pillH * 0.5 * u + 4;
+
+    const inColumn = Math.abs(sx - L.x) <= UI.colHalf * u
+      && sy <= L.summit.y - 3
+      && sy >= L.dotY - UI.dotR * u - 8;
+    const onHeightLabel = Math.abs(sx - L.x) <= labelHW && Math.abs(sy - L.textY) <= labelHH;
+    if (inColumn || onHeightLabel) {
+      return { mode: "height", peakId: active.id, onLabel: onHeightLabel ? "height" : null, peak: active };
+    }
+
+    const wing = slot * 0.5 + (UI.triW + 18) * u;
+    const onWidth = Math.abs(sy - L.widthY) <= UI.rowHalf * u && Math.abs(sx - L.x) <= wing;
+    const onTick = Math.abs(sx - L.x) <= 16 * u && sy >= L.tickTop - 6 && sy <= Math.max(L.tickBot, L.widthY) + 4;
+    const onWidthLabel = Math.abs(sx - L.x) <= labelHW && Math.abs(sy - L.widthY) <= labelHH;
+    if (onWidth || onTick) {
+      return { mode: "width", peakId: active.id, onLabel: onWidthLabel ? "width" : null, peak: active };
+    }
+
+    let body = null;
+    let bodyD = UI.summitPx * u;
+    for (let i = 0; i < state.peaks.length; i++) {
+      const p = state.peaks[i];
+      const Lp = p.id === active.id ? L : stemAnchor(p, v);
+      const ds = Math.hypot(sx - Lp.summit.x, sy - Lp.summit.y);
+      if (ds < bodyD) { bodyD = ds; body = p; }
+      if (p.id !== active.id) {
+        const dStem = distPointSeg(sx, sy, Lp.summit.x, Lp.summit.y, Lp.x, Lp.dotY);
+        if (dStem < 14 * u && dStem < bodyD) { bodyD = dStem; body = p; }
+      }
+    }
+
+    const reach = UI.bodyPx * u;
+    let lineD = reach;
+    let linePeak = null;
+    let apronId = null;
+    let apronD = reach;
+    const loops = geom.loops;
+    for (let i = 0; i < loops.length; i++) {
+      const lp = loops[i];
+      const pts = lp.points;
+      const n = pts.length;
+      for (let k = 0; k < n; k++) {
+        const a = project(pts[k].x, pts[k].y, lp.level, v);
+        const bpt = pts[(k + 1) % n];
+        const b = project(bpt.x, bpt.y, lp.level, v);
+        const d = distPointSeg(sx, sy, a.x, a.y, b.x, b.y);
+        const apron = lp.level < 0.05 && pts[k].peakId === active.id;
+        if (apron && d < apronD) { apronD = d; apronId = pts[k].peakId; }
+        if (d >= lineD || apron) continue;
+        lineD = d;
+        linePeak = peakById(pts[k].peakId);
+      }
+    }
+    if (linePeak && (body == null || lineD < bodyD)) body = linePeak;
+    if (body) return { mode: "body", peakId: body.id, onLabel: null, peak: body, apronId: null };
+    return { mode: "empty", peakId: null, onLabel: null, peak: null, apronId };
+  }
+
+  function toggleSelected(id) {
+    if (state.selected.has(id)) state.selected.delete(id);
+    else state.selected.add(id);
+    state.picked = true;
+  }
+
+  function goldRgba(alpha) {
+    return `rgba(244,220,106,${alpha.toFixed(3)})`;
+  }
+
+  const INNER_STROKE = goldRgba(INNER_ALPHA);
+  const FADED_STROKE = goldRgba(FADED_ALPHA);
+  const IDLE_STROKE = goldRgba(IDLE_ALPHA);
+  const EDGE_STROKE = goldRgba(1);
+
+  function outerLevels(geom) {
+    const map = new Map();
+    const loops = geom.loops;
+    for (let i = 0; i < loops.length; i++) {
+      const level = loops[i].level;
+      const pts = loops[i].points;
+      for (let k = 0; k < pts.length; k++) {
+        const id = pts[k].peakId;
+        const prev = map.get(id);
+        if (prev === undefined || level < prev) map.set(id, level);
+      }
+    }
+    return map;
+  }
+
+  function eachRun(geom, screens, fn) {
+    const loops = geom.loops;
+    for (let i = 0; i < loops.length; i++) {
+      const scr = screens[i];
+      if (!scr) continue;
+      const pts = loops[i].points;
+      const n = pts.length;
+      let start = 0;
+      for (let k = 0; k < n; k++) {
+        if (pts[k].peakId !== pts[(k + 1) % n].peakId) { start = (k + 1) % n; break; }
+      }
+      let i0 = 0;
+      while (i0 < n) {
+        const id = pts[(start + i0) % n].peakId;
+        let j = i0 + 1;
+        while (j < n && pts[(start + j) % n].peakId === id) j++;
+        fn(scr, start, i0, j, n, id, loops[i].level);
+        i0 = j;
+      }
+    }
+  }
+
+  function screenLoops(geom, v) {
+    const loops = geom.loops;
+    const screens = new Array(loops.length);
+    for (let i = 0; i < loops.length; i++) {
+      const pts = loops[i].points;
+      const n = pts.length;
+      if (n < 3) { screens[i] = null; continue; }
+      const scr = new Array(n);
+      const z = loops[i].level;
+      for (let k = 0; k < n; k++) scr[k] = project(pts[k].x, pts[k].y, z, v);
+      screens[i] = scr;
+    }
+    return screens;
+  }
+
+  function strokeRun(scr, start, i0, j, n) {
+    ctx.beginPath();
+    const p0 = scr[(start + i0) % n];
+    ctx.moveTo(p0.x, p0.y);
+    for (let k = i0 + 1; k <= j; k++) {
+      const p = scr[(start + k) % n];
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+
+  function lit(id) {
+    if (!state.picked) return false;
+    if (state.selected.size) return state.selected.has(id);
+    return id === state.activeId;
+  }
+
+  function drawContours(geom, screens) {
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    if (!state.picked && state.selected.size === 0) {
+      ctx.lineWidth = 1.05;
+      ctx.strokeStyle = IDLE_STROKE;
+      eachRun(geom, screens, (scr, start, i0, j, n) => strokeRun(scr, start, i0, j, n));
+      return;
+    }
+    const outer = outerLevels(geom);
+    const rim = (id, level) => {
+      const edge = outer.get(id);
+      return edge !== undefined && level <= edge + 1e-4;
+    };
+    ctx.lineWidth = 1.05;
+    eachRun(geom, screens, (scr, start, i0, j, n, id, level) => {
+      if (lit(id) && rim(id, level)) return;
+      ctx.strokeStyle = lit(id) ? INNER_STROKE : FADED_STROKE;
+      strokeRun(scr, start, i0, j, n);
+    });
+    ctx.lineWidth = 2.6;
+    ctx.strokeStyle = EDGE_STROKE;
+    eachRun(geom, screens, (scr, start, i0, j, n, id, level) => {
+      if (lit(id) && rim(id, level)) strokeRun(scr, start, i0, j, n);
+    });
+  }
+
+  function roundRect(x, y, w, h, r) {
+    const rr = Math.max(0, Math.min(r, w * 0.5, h * 0.5));
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
+
+  function fillTri(x, y, dir, w, h) {
+    ctx.beginPath();
+    if (dir === "up") {
+      ctx.moveTo(x, y - h * 0.5);
+      ctx.lineTo(x + w * 0.5, y + h * 0.5);
+      ctx.lineTo(x - w * 0.5, y + h * 0.5);
+    } else if (dir === "down") {
+      ctx.moveTo(x, y + h * 0.5);
+      ctx.lineTo(x + w * 0.5, y - h * 0.5);
+      ctx.lineTo(x - w * 0.5, y - h * 0.5);
+    } else if (dir === "left") {
+      ctx.moveTo(x - w * 0.5, y);
+      ctx.lineTo(x + w * 0.5, y - h * 0.5);
+      ctx.lineTo(x + w * 0.5, y + h * 0.5);
+    } else {
+      ctx.moveTo(x + w * 0.5, y);
+      ctx.lineTo(x - w * 0.5, y - h * 0.5);
+      ctx.lineTo(x - w * 0.5, y + h * 0.5);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawDot(x, y, r) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawReadout(x, y, text, pill, v, slot) {
+    if (pill) {
+      const pw = slot;
+      const ph = UI.pillH * v.u;
+      ctx.fillStyle = GOLD;
+      roundRect(x - pw * 0.5, y - ph * 0.5, pw, ph, UI.pillR * v.u);
+      ctx.fill();
+      ctx.fillStyle = INK;
+      ctx.fillText(text, x, y + 0.5);
+    } else {
+      ctx.fillStyle = GOLD;
+      ctx.fillText(text, x, y + 0.5);
+    }
+  }
+
+  function drawManipulators(geom, v) {
+    const u = v.u;
+    const active = activePeak();
+    setFont(v);
+    const slot = slotWidth(v);
+    const triW = UI.triW * u;
+    const triH = UI.triH * u;
+    const dotR = UI.dotR * u;
+    const showH = state.hoverLabel === "height" || (pointer && pointer.mode === "height");
+    const showW = state.hoverLabel === "width" || (pointer && pointer.mode === "width");
+
+    ctx.lineWidth = 1.15;
+    ctx.lineCap = "round";
+    for (let i = 0; i < state.peaks.length; i++) {
+      const p = state.peaks[i];
+      if (p.id === active.id) continue;
+      const mark = !state.picked && state.selected.size === 0
+        ? IDLE_STEM
+        : lit(p.id) ? SELECT_STEM : FADED_STEM;
+      ctx.strokeStyle = mark;
+      ctx.fillStyle = mark;
+      const L = stemAnchor(p, v);
+      ctx.beginPath();
+      ctx.moveTo(L.summit.x, L.summit.y);
+      ctx.lineTo(L.x, L.dotY);
+      ctx.stroke();
+      drawDot(L.x, L.dotY, dotR);
+    }
+
+    const L = layoutOf(active, v, geom);
+    ctx.strokeStyle = GOLD;
+    ctx.fillStyle = GOLD;
+    ctx.beginPath();
+    ctx.moveTo(L.x, L.summit.y);
+    ctx.lineTo(L.x, L.downY + triH * 0.5 + UI.stemGap * u);
+    ctx.stroke();
+    if (L.tickBot > L.tickTop + 2) {
+      ctx.beginPath();
+      ctx.moveTo(L.x, L.tickTop);
+      ctx.lineTo(L.x, L.tickBot);
+      ctx.stroke();
+    }
+    drawDot(L.x, L.dotY, dotR);
+    fillTri(L.x, L.upY, "up", triW, triH);
+    fillTri(L.x, L.downY, "down", triW, triH);
+    const side = slot * 0.5 + 8 * u + triH * 0.5;
+    fillTri(L.x - side, L.widthY, "left", triH, triW);
+    fillTri(L.x + side, L.widthY, "right", triH, triW);
+    drawReadout(L.x, L.textY, format2(active.amplitude), showH, v, slot);
+    drawReadout(L.x, L.widthY, format2(active.radius), showW, v, slot);
+  }
+
+  function paint() {
+    if (settle) settle.now = performance.now();
+    const geom = ensureGeom();
+    const v = view();
+    ctx.setTransform(canvas.width / cssW, 0, 0, canvas.height / cssH, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, cssW, cssH);
+    const screens = screenLoops(geom, v);
+    drawContours(geom, screens);
+    drawManipulators(geom, v);
+  }
+
+  function requestDraw() {
+    if (raf) return;
+    raf = requestAnimationFrame(() => { raf = 0; paint(); });
+  }
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2.5, window.devicePixelRatio || 1));
+    cssW = Math.max(1, window.innerWidth);
+    cssH = Math.max(1, window.innerHeight);
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    paint();
+  }
+
+  function updateCursor(hit, dragging) {
+    if (dragging === "orbit" || dragging === "pinch") canvas.style.cursor = "grabbing";
+    else if (dragging === "height" || dragging === "width") canvas.style.cursor = "pointer";
+    else if (dragging === "body") canvas.style.cursor = "grabbing";
+    else if (hit && (hit.mode === "height" || hit.mode === "width")) canvas.style.cursor = "pointer";
+    else if (hit && hit.mode === "body") canvas.style.cursor = "grab";
+    else canvas.style.cursor = "default";
+  }
+
+  function clampPan() {
+    const v = view();
+    let sx = 0;
+    let sy = 0;
+    const n = state.peaks.length;
+    if (!n) return;
+    for (let i = 0; i < n; i++) {
+      const p = state.peaks[i];
+      const s = project(p.x, p.y, sample(p.x, p.y), v);
+      sx += s.x;
+      sy += s.y;
+    }
+    sx /= n;
+    sy /= n;
+    const m = PAN_MARGIN;
+    let dx = 0;
+    let dy = 0;
+    if (sx < m) dx = m - sx;
+    else if (sx > cssW - m) dx = cssW - m - sx;
+    if (sy < m) dy = m - sy;
+    else if (sy > cssH - m) dy = cssH - m - sy;
+    if (dx || dy) {
+      cam.panX += dx;
+      cam.panY += dy;
+    }
+  }
+
+  function smoothstep(t) {
+    return t * t * (3 - 2 * t);
+  }
+
+  function growValue(elapsed) {
+    const t = clamp(elapsed / GROW_MS, 0, 1);
+    return BIRTH + (FULL - BIRTH) * smoothstep(t);
+  }
+
+  function beginGrow(now) {
+    const g = unproject(pointer.startX, pointer.startY, view());
+    const peak = addPeak(g.x, g.y, BIRTH, BIRTH);
+    pointer.mode = "grow";
+    pointer.peakId = peak.id;
+    pointer.growT0 = now;
+    pointer.bornX = peak.x;
+    pointer.bornY = peak.y;
+  }
+
+  function applyGrow(now) {
+    const peak = peakById(pointer.peakId);
+    if (!peak) return true;
+    const v = growValue(now - pointer.growT0);
+    if (peak.amplitude !== v || peak.radius !== v) {
+      peak.amplitude = v;
+      peak.radius = v;
+      state.geomDirty = true;
+    }
+    return v >= FULL - 1e-9;
+  }
+
+  function releaseVelocity(trail) {
+    if (!trail || trail.length < 2) return { speed: 0, dir: 0 };
+    const end = trail[trail.length - 1];
+    const tau = 48;
+    let w = 0, wt = 0, wtt = 0;
+    let wx = 0, wy = 0, wtx = 0, wty = 0;
+    let wgx = 0, wgy = 0, wtgx = 0, wtgy = 0;
+    let n = 0;
+    for (let i = 0; i < trail.length; i++) {
+      const p = trail[i];
+      const age = end.t - p.t;
+      if (age > 160) continue;
+      const weight = Math.exp(-age / tau);
+      const t = -age;
+      w += weight;
+      wt += weight * t;
+      wtt += weight * t * t;
+      wx += weight * p.sx;
+      wy += weight * p.sy;
+      wtx += weight * t * p.sx;
+      wty += weight * t * p.sy;
+      wgx += weight * p.gx;
+      wgy += weight * p.gy;
+      wtgx += weight * t * p.gx;
+      wtgy += weight * t * p.gy;
+      n++;
+    }
+    const denom = w * wtt - wt * wt;
+    if (n < 2 || Math.abs(denom) < 1e-4) return { speed: 0, dir: 0 };
+    const vx = (w * wtx - wt * wx) / denom;
+    const vy = (w * wty - wt * wy) / denom;
+    const gvx = (w * wtgx - wt * wgx) / denom;
+    const gvy = (w * wtgy - wt * wgy) / denom;
+    const dir = gvx * gvx + gvy * gvy > 1e-12 ? Math.atan2(gvy, gvx) : 0;
+    return { speed: Math.hypot(vx, vy), dir };
+  }
+
+  function rememberTrail(sx, sy, gx, gy) {
+    const t = performance.now();
+    if (!pointer.trail) pointer.trail = [];
+    pointer.trail.push({ t, sx, sy, gx, gy });
+    const cutoff = t - 160;
+    while (pointer.trail.length > 2 && pointer.trail[0].t < cutoff) pointer.trail.shift();
+  }
+
+  function beginSettle(ids, trail) {
+    const vel = releaseVelocity(trail);
+    const amp = Math.min(SETTLE_MAX, vel.speed * SETTLE_GAIN);
+    if (!(amp >= SETTLE_MIN)) {
+      settle = null;
+      return;
+    }
+    const now = performance.now();
+    const idSet = new Set();
+    for (let i = 0; i < ids.length; i++) idSet.add(ids[i]);
+    settle = { t0: now, now, amp, dir: vel.dir, ids: idSet };
+    state.geomDirty = true;
+    ensureSettle();
+  }
+
+  function ensureSettle() {
+    if (settleFrame) return;
+    const step = (now) => {
+      settleFrame = 0;
+      if (!settle) return;
+      const age = now - settle.t0;
+      const env = settle.amp * Math.exp(-(age / 1000) / SETTLE_TAU);
+      if (age >= SETTLE_MS || env < 0.0015) {
+        settle = null;
+        state.geomDirty = true;
+        paint();
+        return;
+      }
+      state.geomDirty = true;
+      paint();
+      settleFrame = requestAnimationFrame(step);
+    };
+    settleFrame = requestAnimationFrame(step);
+  }
+
+  function ensureLive() {
+    if (liveFrame) return;
+    const step = (now) => {
+      liveFrame = 0;
+      if (!pointer || pointer.mode !== "grow") return;
+      const done = applyGrow(now);
+      paint();
+      if (!done && pointer && pointer.mode === "grow") liveFrame = requestAnimationFrame(step);
+    };
+    liveFrame = requestAnimationFrame(step);
+  }
+
+  function fingerList() {
+    return Array.from(fingers.values());
+  }
+
+  function pinchMeasure() {
+    const f = fingerList();
+    if (f.length < 2) return null;
+    const a = f[0];
+    const b = f[1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    return {
+      dist: Math.max(1, Math.hypot(dx, dy)),
+      cx: (a.x + b.x) * 0.5,
+      cy: (a.y + b.y) * 0.5,
+    };
+  }
+
+  function beginPinch() {
+    const m = pinchMeasure();
+    if (!m) return;
+    // A second finger ends sculpting. Growth freezes where it is. Twist does not yaw.
+    lastTap = null;
+    pointer = {
+      id: -1,
+      mode: "pinch",
+      dist: m.dist,
+      cx: m.cx,
+      cy: m.cy,
+      zoom: cam.zoom,
+      panX: cam.panX,
+      panY: cam.panY,
+    };
+    canvas.style.cursor = "grabbing";
+  }
+
+  function applyPinch() {
+    if (!pointer || pointer.mode !== "pinch") return;
+    const m = pinchMeasure();
+    if (!m) return;
+    cam.zoom = clamp(pointer.zoom * (m.dist / pointer.dist), ZOOM_MIN, ZOOM_MAX);
+    cam.panX = pointer.panX + (m.cx - pointer.cx);
+    cam.panY = pointer.panY + (m.cy - pointer.cy);
+    clampPan();
+  }
+
+  function beginOrbit(id, x, y) {
+    pointer = { id, mode: "orbit", lastX: x, lastY: y, moved: true, startX: x, startY: y };
+    canvas.style.cursor = "grabbing";
+  }
+
+  function groupSnapshot(id) {
+    if (!state.selected.has(id)) return null;
+    const group = [];
+    for (let i = 0; i < state.peaks.length; i++) {
+      const p = state.peaks[i];
+      if (state.selected.has(p.id)) group.push({ id: p.id, x: p.x, y: p.y });
+    }
+    return group;
+  }
+
+  // A press on the active hill's base starts as a click. Once it moves, it
+  // drags that hill instead of orbiting, so the release can wobble.
+  function beginHillDrag(e) {
+    const id = pointer.apronId;
+    const peak = peakById(id);
+    const v = view();
+    const g0 = unproject(pointer.startX, pointer.startY, v);
+    const g = unproject(e.clientX, e.clientY, v);
+    if (settle) {
+      settle = null;
+      state.geomDirty = true;
+    }
+    if (!pointer.shift) state.activeId = id;
+    const t0 = pointer.t0;
+    pointer = {
+      id: pointer.id,
+      mode: "body",
+      peakId: id,
+      startX: pointer.startX,
+      startY: pointer.startY,
+      moved: true,
+      shift: !!pointer.shift,
+      group: groupSnapshot(id),
+      startAmp: peak.amplitude,
+      startR: peak.radius,
+      ox: peak.x,
+      oy: peak.y,
+      gx: g0.x,
+      gy: g0.y,
+      trail: [
+        { t: t0, sx: pointer.startX, sy: pointer.startY, gx: g0.x, gy: g0.y },
+        { t: performance.now(), sx: e.clientX, sy: e.clientY, gx: g.x, gy: g.y },
+      ],
+    };
+    canvas.style.cursor = "grabbing";
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.focus();
+    if (e.pointerType === "touch") {
+      fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (fingers.size >= 2) {
+        beginPinch();
+        try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic */ }
+        paint();
+        return;
+      }
+    }
+    if (e.button === 2) {
+      beginOrbit(e.pointerId, e.clientX, e.clientY);
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic */ }
+      return;
+    }
+    if (e.button !== 0 && e.pointerType !== "touch") return;
+    const hit = hitTest(e.clientX, e.clientY);
+    const peak = hit.peak;
+    const g = unproject(e.clientX, e.clientY, view());
+    if (hit.mode === "empty") {
+      const now = performance.now();
+      const dbl = lastTap
+        && (now - lastTap.t) <= DBL_MS
+        && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) <= DBL_PX;
+      if (dbl) {
+        lastTap = null;
+        pointer = {
+          id: e.pointerId,
+          mode: "grow",
+          startX: e.clientX,
+          startY: e.clientY,
+          moved: false,
+        };
+        beginGrow(now);
+        ensureLive();
+      } else {
+        // A single press does not add a peak. A drag from here orbits.
+        pointer = {
+          id: e.pointerId,
+          mode: "arm",
+          startX: e.clientX,
+          startY: e.clientY,
+          moved: false,
+          shift: !!e.shiftKey,
+          apronId: hit.apronId,
+          t0: performance.now(),
+        };
+      }
+    } else {
+      const shift = !!e.shiftKey;
+      if (hit.mode === "body" && settle) {
+        settle = null;
+        state.geomDirty = true;
+      }
+      let group = null;
+      if (hit.mode === "body" && state.selected.has(hit.peakId)) group = groupSnapshot(hit.peakId);
+      pointer = {
+        id: e.pointerId,
+        mode: hit.mode,
+        peakId: hit.peakId,
+        startX: e.clientX,
+        startY: e.clientY,
+        moved: false,
+        shift,
+        group,
+        startAmp: peak ? peak.amplitude : 0,
+        startR: peak ? peak.radius : 0,
+        ox: peak ? peak.x : 0,
+        oy: peak ? peak.y : 0,
+        gx: g.x,
+        gy: g.y,
+        trail: hit.mode === "body"
+          ? [{ t: performance.now(), sx: e.clientX, sy: e.clientY, gx: g.x, gy: g.y }]
+          : null,
+      };
+      // A plain press activates the hill. Shift waits for the click, so a
+      // shift-tap can join the group without stealing the handles.
+      if (hit.mode === "body" && !shift) state.activeId = hit.peakId;
+    }
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+    updateCursor(hit, hit.mode === "empty" ? null : hit.mode);
+    paint();
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (fingers.has(e.pointerId)) fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointer && pointer.mode === "pinch") {
+      applyPinch();
+      paint();
+      return;
+    }
+    if (pointer && pointer.id === e.pointerId) {
+      const dist = Math.hypot(e.clientX - pointer.startX, e.clientY - pointer.startY);
+      if (dist > CLICK) pointer.moved = true;
+      if (pointer.mode === "arm" && pointer.moved) {
+        if (pointer.apronId) beginHillDrag(e);
+        else beginOrbit(e.pointerId, pointer.startX, pointer.startY);
+      }
+      if (pointer.mode === "orbit") {
+        const dx = e.clientX - pointer.lastX;
+        const dy = e.clientY - pointer.lastY;
+        pointer.lastX = e.clientX;
+        pointer.lastY = e.clientY;
+        cam.yaw -= dx * YAW_SENS;
+        cam.pitch = clamp(cam.pitch - dy * PITCH_SENS, PITCH_MIN, PITCH_MAX);
+        paint();
+        return;
+      }
+      if (pointer.mode === "grow" || pointer.mode === "arm") {
+        // The second press grows in place. A single press waits to see if it is a drag.
+        return;
+      }
+      const peak = pointer.peakId == null ? null : peakById(pointer.peakId);
+      if (pointer.mode === "height" && peak) {
+        peak.amplitude = clamp(pointer.startAmp - (e.clientY - pointer.startY) * SENS, MIN_V, MAX_V);
+        state.geomDirty = true;
+      } else if (pointer.mode === "width" && peak) {
+        peak.radius = clamp(pointer.startR + (e.clientX - pointer.startX) * SENS, MIN_V, MAX_V);
+        state.geomDirty = true;
+      } else if (pointer.mode === "body" && peak) {
+        const g = unproject(e.clientX, e.clientY, view());
+        rememberTrail(e.clientX, e.clientY, g.x, g.y);
+        const dx = g.x - pointer.gx;
+        const dy = g.y - pointer.gy;
+        if (pointer.group) {
+          for (let i = 0; i < pointer.group.length; i++) {
+            const m = pointer.group[i];
+            const q = peakById(m.id);
+            q.x = m.x + dx;
+            q.y = m.y + dy;
+          }
+        } else {
+          peak.x = pointer.ox + dx;
+          peak.y = pointer.oy + dy;
+        }
+        state.geomDirty = true;
+      }
+      requestDraw();
+      return;
+    }
+    const hit = hitTest(e.clientX, e.clientY);
+    const label = hit.onLabel;
+    if (label !== state.hoverLabel) {
+      state.hoverLabel = label;
+      requestDraw();
+    }
+    updateCursor(hit, null);
+  });
+
+  function endPointer(e) {
+    if (e && fingers.has(e.pointerId)) fingers.delete(e.pointerId);
+    if (pointer && pointer.mode === "pinch") {
+      if (fingers.size < 2) pointer = null;
+      else beginPinch();
+      updateCursor(null, null);
+      paint();
+      return;
+    }
+    if (!pointer || (e && pointer.id !== e.pointerId)) return;
+    const ended = pointer;
+    if (ended.mode === "arm" && !ended.moved && ended.apronId) {
+      if (ended.shift) {
+        toggleSelected(ended.apronId);
+        lastTap = null;
+      } else {
+        state.activeId = ended.apronId;
+        state.selected.clear();
+        state.picked = true;
+        lastTap = { t: performance.now(), x: ended.startX, y: ended.startY };
+      }
+    } else if (ended.mode === "arm" && !ended.moved) {
+      state.selected.clear();
+      state.picked = false;
+      lastTap = { t: performance.now(), x: ended.startX, y: ended.startY };
+    } else if (ended.mode !== "grow") {
+      lastTap = null;
+    }
+    if (ended.mode === "body" && ended.moved) {
+      const ids = ended.group ? ended.group.map((m) => m.id) : [ended.peakId];
+      beginSettle(ids, ended.trail);
+    } else if (ended.mode === "body" && !ended.moved) {
+      if (ended.shift) toggleSelected(ended.peakId);
+      else {
+        state.activeId = ended.peakId;
+        state.selected.clear();
+        state.picked = true;
+      }
+    }
+    pointer = null;
+    const hit = e ? hitTest(e.clientX, e.clientY) : { onLabel: null, mode: "empty" };
+    state.hoverLabel = hit.onLabel || null;
+    updateCursor(hit, null);
+    paint();
+  }
+
+  function wheelPixels(delta, mode) {
+    if (mode === 1) return delta * 16;
+    if (mode === 2) return delta * 120;
+    return delta;
+  }
+
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const dy = wheelPixels(e.deltaY, e.deltaMode);
+    const dx = wheelPixels(e.deltaX, e.deltaMode);
+    if (e.shiftKey) {
+      cam.pitch = clamp(cam.pitch - dy * 0.0022, PITCH_MIN, PITCH_MAX);
+    } else if (e.ctrlKey) {
+      cam.zoom = clamp(cam.zoom * Math.exp(-dy * 0.01), ZOOM_MIN, ZOOM_MAX);
+      clampPan();
+    } else if (Math.abs(dx) > Math.abs(dy) * 1.15 && Math.abs(dx) > 0.4) {
+      cam.panX -= dx;
+      clampPan();
+    } else {
+      cam.zoom = clamp(cam.zoom * Math.exp(-dy * 0.00115), ZOOM_MIN, ZOOM_MAX);
+      clampPan();
+    }
+    paint();
+  }, { passive: false });
+
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+
+  canvas.addEventListener("pointerleave", (e) => {
+    if (pointer) return;
+    if (state.hoverLabel) {
+      state.hoverLabel = null;
+      requestDraw();
+    }
+    canvas.style.cursor = "default";
+  });
+
+  function deletePeaks() {
+    if (state.peaks.length <= 1) return;
+    const drop = state.selected.size ? state.selected : new Set([state.activeId]);
+    const keep = [];
+    for (let i = 0; i < state.peaks.length; i++) {
+      if (!drop.has(state.peaks[i].id)) keep.push(state.peaks[i]);
+    }
+    // A group that covers every hill still leaves the last peak.
+    if (keep.length === 0) keep.push(state.peaks[state.peaks.length - 1]);
+    const kept = new Set();
+    for (let i = 0; i < keep.length; i++) kept.add(keep[i].id);
+    const stale = [];
+    for (const id of state.selected) if (!kept.has(id)) stale.push(id);
+    for (let i = 0; i < stale.length; i++) state.selected.delete(stale[i]);
+    if (keep.length === 1) state.selected.clear();
+    state.peaks = keep;
+    if (!kept.has(state.activeId)) state.activeId = keep[keep.length - 1].id;
+    state.geomDirty = true;
+    state.hoverLabel = null;
+    paint();
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Backspace" && e.key !== "Delete") return;
+    e.preventDefault();
+    deletePeaks();
+  });
+
+  window.addEventListener("resize", resize);
+
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  function publicHit(sx, sy) {
+    const h = hitTest(sx, sy);
+    return { mode: h.mode, peakId: h.peakId, onLabel: h.onLabel };
+  }
+
+  window.__sculptor = {
+    getPeaks() {
+      return state.peaks.map((p) => ({
+        id: p.id, x: p.x, y: p.y,
+        amplitude: p.amplitude, radius: p.radius,
+        phase: p.phase, phase2: p.phase2,
+      }));
+    },
+    getActiveId() { return state.activeId; },
+    getSelected() { return [...state.selected].sort((a, b) => a - b); },
+    getSettle() {
+      if (!settle) return null;
+      const age = settle.now - settle.t0;
+      const t = age / 1000;
+      return {
+        amp: settle.amp,
+        age,
+        wave: settleWave(),
+        env: settle.amp * Math.exp(-Math.abs(t) / SETTLE_TAU),
+        n: settle.ids.size,
+      };
+    },
+    sample,
+    hitTest: publicHit,
+    view() {
+      const v = view();
+      return {
+        cx: v.cx, cy: v.cy, s: v.s, zScale: v.zScale, compress: v.vCompress, u: v.u, w: cssW, h: cssH,
+        yaw: v.yaw, pitch: v.pitch, zoom: v.zoom,
+      };
+    },
+    getCamera() {
+      return {
+        yaw: cam.yaw, pitch: cam.pitch, zoom: cam.zoom,
+        panX: cam.panX, panY: cam.panY,
+        pitchMin: PITCH_MIN, pitchMax: PITCH_MAX,
+        zoomMin: ZOOM_MIN, zoomMax: ZOOM_MAX,
+      };
+    },
+    stats() {
+      const g = ensureGeom();
+      const counts = {};
+      for (const lp of g.loops) {
+        const k = lp.level.toFixed(2);
+        counts[k] = (counts[k] || 0) + 1;
+      }
+      return { levels: g.levels.slice(), counts, cols: g.cols, rows: g.rows, maxF: g.maxF, loops: g.loops.length };
+    },
+    reset() {
+      state.peaks = [{
+        id: 1, x: 0, y: 0, amplitude: 0.30, radius: 0.30, phase: 0.85, phase2: 2.35,
+      }];
+      state.activeId = 1;
+      state.nextId = 2;
+      state.selected.clear();
+      state.picked = true;
+      state.hoverLabel = null;
+      state.geomDirty = true;
+      pointer = null;
+      settle = null;
+      fingers.clear();
+      lastTap = null;
+      cam.yaw = 0;
+      cam.pitch = PITCH0;
+      cam.zoom = 1;
+      cam.panX = 0;
+      cam.panY = 0;
+      paint();
+    },
+    setPeaks(list, activeId) {
+      state.peaks = list.map((p) => ({
+        id: p.id, x: p.x, y: p.y,
+        amplitude: p.amplitude, radius: p.radius,
+        phase: p.phase, phase2: p.phase2,
+      }));
+      state.nextId = state.peaks.reduce((m, p) => Math.max(m, p.id), 0) + 1;
+      state.activeId = activeId;
+      state.selected.clear();
+      state.picked = true;
+      state.hoverLabel = null;
+      state.geomDirty = true;
+      pointer = null;
+      settle = null;
+      paint();
+    },
+    setHover(which) {
+      state.hoverLabel = which;
+      paint();
+    },
+    layoutActive() {
+      const v = view();
+      const g = ensureGeom();
+      const L = layoutOf(activePeak(), v, g);
+      return {
+        summitX: L.summit.x, summitY: L.summit.y,
+        textY: L.textY, widthY: L.widthY, dotY: L.dotY,
+        tickTop: L.tickTop, tickBot: L.tickBot, bottom: L.bottom, x: L.x,
+      };
+    },
+  };
+
+  resize();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => paint());
+})();
+</script>
+</body>
+</html>
