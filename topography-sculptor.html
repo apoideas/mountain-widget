@@ -118,14 +118,25 @@
   let cssW = 1;
   let cssH = 1;
   let cache = null;
+  let screensCache = null;
   let pointer = null;
   let raf = 0;
-  let liveFrame = 0;
   let settle = null;
-  let settleFrame = 0;
   const fingers = new Map();
   const cam = { yaw: 0, pitch: PITCH0, zoom: 1, panX: 0, panY: 0 };
   let lastTap = null;
+
+  function wantPreview() {
+    if (settle) return true;
+    if (!pointer) return false;
+    const m = pointer.mode;
+    return m === "height" || m === "width" || m === "body" || m === "grow";
+  }
+
+  function markGeomDirty() {
+    state.geomDirty = true;
+    screensCache = null;
+  }
 
   function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
 
@@ -147,7 +158,7 @@
     state.activeId = peak.id;
     state.selected.clear();
     state.picked = true;
-    state.geomDirty = true;
+    markGeomDirty();
     return peak;
   }
 
@@ -260,9 +271,10 @@
     return h;
   }
 
-  function smoothClosed(pts) {
+  function smoothClosed(pts, passes) {
     let cur = pts;
-    for (let pass = 0; pass < 2; pass++) {
+    const nPass = passes == null ? 2 : passes;
+    for (let pass = 0; pass < nPass; pass++) {
       const n = cur.length;
       const next = new Array(n);
       for (let i = 0; i < n; i++) {
@@ -431,7 +443,7 @@
     return out;
   }
 
-  function buildContours() {
+  function buildContours(preview) {
     const peaks = state.peaks;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     let minR = Infinity;
@@ -446,11 +458,16 @@
     }
     const rangeX = Math.max(1e-4, maxX - minX);
     const rangeY = Math.max(1e-4, maxY - minY);
-    const cell = Math.min(minR / 46, Math.max(rangeX, rangeY) / 280);
+    // Preview grid is coarser while dragging / settling so remarch stays interactive.
+    const cellDiv = preview ? 28 : 46;
+    const rangeDiv = preview ? 160 : 280;
+    const colMin = preview ? 120 : 280;
+    const colMax = preview ? 220 : 440;
+    const cell = Math.min(minR / cellDiv, Math.max(rangeX, rangeY) / rangeDiv);
     let cols = Math.ceil(rangeX / cell) + 1;
     let rows = Math.ceil(rangeY / cell) + 1;
-    cols = Math.max(280, Math.min(440, cols));
-    rows = Math.max(280, Math.min(440, rows));
+    cols = Math.max(colMin, Math.min(colMax, cols));
+    rows = Math.max(colMin, Math.min(colMax, rows));
     const dx = rangeX / (cols - 1);
     const dy = rangeY / (rows - 1);
     const field = new Float32Array(cols * rows);
@@ -467,13 +484,16 @@
         field[row + i] = h > 0 ? h + ((row + i) % 13 + 1) * 1e-8 : 0;
       }
     }
+    const levelStep = preview ? 0.03 : 0.02;
     const levels = [];
     for (let i = 0; ; i++) {
-      const L = 0.01 + i * 0.02;
+      const L = 0.01 + i * levelStep;
       if (L >= maxF - 1e-4) break;
       levels.push(L);
     }
     const loops = [];
+    const minPer = preview ? 0.05 : 0.035;
+    const smoothPasses = preview ? 1 : 2;
     for (let li = 0; li < levels.length; li++) {
       const level = levels[li];
       const raw = traceLevel(field, cols, rows, level);
@@ -488,19 +508,63 @@
           const b = world[(k + 1) % world.length];
           per += Math.hypot(b[0] - a[0], b[1] - a[1]);
         }
-        if (per < 0.035 || world.length < 8) continue;
-        const smooth = smoothClosed(world);
+        if (per < minPer || world.length < 8) continue;
+        const smooth = smoothClosed(world, smoothPasses);
         loops.push({ level, points: tagOwners(smooth) });
       }
     }
-    return { loops, levels, cols, rows, maxF };
+    return { loops, levels, cols, rows, maxF, quality: preview ? "preview" : "full" };
   }
 
   function ensureGeom() {
-    if (!state.geomDirty && cache) return cache;
-    cache = buildContours();
+    const preview = wantPreview();
+    const quality = preview ? "preview" : "full";
+    if (!state.geomDirty && cache) {
+      if (cache.quality === quality) return cache;
+      // A full-res cache is fine to draw during a preview moment if geometry is unchanged.
+      if (cache.quality === "full" && quality === "preview") return cache;
+    }
+    cache = buildContours(preview);
     state.geomDirty = false;
+    screensCache = null;
     return cache;
+  }
+
+  function viewKey(v) {
+    return [
+      cssW, cssH,
+      v.cx.toFixed(2), v.cy.toFixed(2),
+      v.s.toFixed(4),
+      v.sinPitch.toFixed(5),
+      v.yaw.toFixed(5),
+      v.zoom.toFixed(4),
+    ].join("|");
+  }
+
+  function aabbOf(scr) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < scr.length; i++) {
+      const p = scr[i];
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return { minX, minY, maxX, maxY };
+  }
+
+  function ensureScreens(geom, v) {
+    const key = viewKey(v);
+    if (screensCache && screensCache.key === key && screensCache.geom === geom) {
+      return screensCache;
+    }
+    const screens = screenLoops(geom, v);
+    const aabbs = new Array(screens.length);
+    for (let i = 0; i < screens.length; i++) {
+      aabbs[i] = screens[i] ? aabbOf(screens[i]) : null;
+    }
+    screensCache = { key, geom, screens, aabbs };
+    return screensCache;
   }
 
   function setFont(v) {
@@ -593,6 +657,7 @@
   function hitTest(sx, sy) {
     const v = view();
     const geom = ensureGeom();
+    const sc = ensureScreens(geom, v);
     const active = activePeak();
     const L = layoutOf(active, v, geom);
     const u = v.u;
@@ -631,19 +696,25 @@
     }
 
     const reach = UI.bodyPx * u;
+    const pad = reach + 2;
     let lineD = reach;
     let linePeak = null;
     let apronId = null;
     let apronD = reach;
     const loops = geom.loops;
     for (let i = 0; i < loops.length; i++) {
+      const box = sc.aabbs[i];
+      if (box && (sx < box.minX - pad || sx > box.maxX + pad || sy < box.minY - pad || sy > box.maxY + pad)) {
+        continue;
+      }
+      const scr = sc.screens[i];
+      if (!scr) continue;
       const lp = loops[i];
       const pts = lp.points;
       const n = pts.length;
       for (let k = 0; k < n; k++) {
-        const a = project(pts[k].x, pts[k].y, lp.level, v);
-        const bpt = pts[(k + 1) % n];
-        const b = project(bpt.x, bpt.y, lp.level, v);
+        const a = scr[k];
+        const b = scr[(k + 1) % n];
         const d = distPointSeg(sx, sy, a.x, a.y, b.x, b.y);
         const apron = lp.level < 0.05 && pts[k].peakId === active.id;
         if (apron && d < apronD) { apronD = d; apronId = pts[k].peakId; }
@@ -882,14 +953,38 @@
     ctx.setTransform(canvas.width / cssW, 0, 0, canvas.height / cssH, 0, 0);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, cssW, cssH);
-    const screens = screenLoops(geom, v);
-    drawContours(geom, screens);
+    const sc = ensureScreens(geom, v);
+    drawContours(geom, sc.screens);
     drawManipulators(geom, v);
+  }
+
+  function needsAnim() {
+    if (settle) return true;
+    if (pointer && pointer.mode === "grow") return true;
+    return false;
+  }
+
+  function frame(now) {
+    raf = 0;
+    if (pointer && pointer.mode === "grow") applyGrow(now);
+    if (settle) {
+      settle.now = now;
+      const age = now - settle.t0;
+      const env = settle.amp * Math.exp(-(age / 1000) / SETTLE_TAU);
+      if (age >= SETTLE_MS || env < 0.0015) {
+        settle = null;
+        markGeomDirty();
+      } else {
+        markGeomDirty();
+      }
+    }
+    paint();
+    if (needsAnim()) raf = requestAnimationFrame(frame);
   }
 
   function requestDraw() {
     if (raf) return;
-    raf = requestAnimationFrame(() => { raf = 0; paint(); });
+    raf = requestAnimationFrame(frame);
   }
 
   function resize() {
@@ -898,6 +993,7 @@
     cssH = Math.max(1, window.innerHeight);
     canvas.width = Math.round(cssW * dpr);
     canvas.height = Math.round(cssH * dpr);
+    screensCache = null;
     paint();
   }
 
@@ -963,7 +1059,7 @@
     if (peak.amplitude !== v || peak.radius !== v) {
       peak.amplitude = v;
       peak.radius = v;
-      state.geomDirty = true;
+      markGeomDirty();
     }
     return v >= FULL - 1e-9;
   }
@@ -1024,40 +1120,8 @@
     const idSet = new Set();
     for (let i = 0; i < ids.length; i++) idSet.add(ids[i]);
     settle = { t0: now, now, amp, dir: vel.dir, ids: idSet };
-    state.geomDirty = true;
-    ensureSettle();
-  }
-
-  function ensureSettle() {
-    if (settleFrame) return;
-    const step = (now) => {
-      settleFrame = 0;
-      if (!settle) return;
-      const age = now - settle.t0;
-      const env = settle.amp * Math.exp(-(age / 1000) / SETTLE_TAU);
-      if (age >= SETTLE_MS || env < 0.0015) {
-        settle = null;
-        state.geomDirty = true;
-        paint();
-        return;
-      }
-      state.geomDirty = true;
-      paint();
-      settleFrame = requestAnimationFrame(step);
-    };
-    settleFrame = requestAnimationFrame(step);
-  }
-
-  function ensureLive() {
-    if (liveFrame) return;
-    const step = (now) => {
-      liveFrame = 0;
-      if (!pointer || pointer.mode !== "grow") return;
-      const done = applyGrow(now);
-      paint();
-      if (!done && pointer && pointer.mode === "grow") liveFrame = requestAnimationFrame(step);
-    };
-    liveFrame = requestAnimationFrame(step);
+    markGeomDirty();
+    requestDraw();
   }
 
   function fingerList() {
@@ -1131,7 +1195,7 @@
     const g = unproject(e.clientX, e.clientY, v);
     if (settle) {
       settle = null;
-      state.geomDirty = true;
+      markGeomDirty();
     }
     if (!pointer.shift) state.activeId = id;
     const t0 = pointer.t0;
@@ -1165,7 +1229,7 @@
       if (fingers.size >= 2) {
         beginPinch();
         try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic */ }
-        paint();
+        requestDraw();
         return;
       }
     }
@@ -1193,7 +1257,7 @@
           moved: false,
         };
         beginGrow(now);
-        ensureLive();
+        requestDraw();
       } else {
         // A single press does not add a peak. A drag from here orbits.
         pointer = {
@@ -1211,7 +1275,7 @@
       const shift = !!e.shiftKey;
       if (hit.mode === "body" && settle) {
         settle = null;
-        state.geomDirty = true;
+        markGeomDirty();
       }
       let group = null;
       if (hit.mode === "body" && state.selected.has(hit.peakId)) group = groupSnapshot(hit.peakId);
@@ -1240,14 +1304,14 @@
     }
     try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
     updateCursor(hit, hit.mode === "empty" ? null : hit.mode);
-    paint();
+    requestDraw();
   });
 
   canvas.addEventListener("pointermove", (e) => {
     if (fingers.has(e.pointerId)) fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointer && pointer.mode === "pinch") {
       applyPinch();
-      paint();
+      requestDraw();
       return;
     }
     if (pointer && pointer.id === e.pointerId) {
@@ -1264,7 +1328,7 @@
         pointer.lastY = e.clientY;
         cam.yaw -= dx * YAW_SENS;
         cam.pitch = clamp(cam.pitch - dy * PITCH_SENS, PITCH_MIN, PITCH_MAX);
-        paint();
+        requestDraw();
         return;
       }
       if (pointer.mode === "grow" || pointer.mode === "arm") {
@@ -1274,10 +1338,10 @@
       const peak = pointer.peakId == null ? null : peakById(pointer.peakId);
       if (pointer.mode === "height" && peak) {
         peak.amplitude = clamp(pointer.startAmp - (e.clientY - pointer.startY) * SENS, MIN_V, MAX_V);
-        state.geomDirty = true;
+        markGeomDirty();
       } else if (pointer.mode === "width" && peak) {
         peak.radius = clamp(pointer.startR + (e.clientX - pointer.startX) * SENS, MIN_V, MAX_V);
-        state.geomDirty = true;
+        markGeomDirty();
       } else if (pointer.mode === "body" && peak) {
         const g = unproject(e.clientX, e.clientY, view());
         rememberTrail(e.clientX, e.clientY, g.x, g.y);
@@ -1294,7 +1358,7 @@
           peak.x = pointer.ox + dx;
           peak.y = pointer.oy + dy;
         }
-        state.geomDirty = true;
+        markGeomDirty();
       }
       requestDraw();
       return;
@@ -1314,7 +1378,7 @@
       if (fingers.size < 2) pointer = null;
       else beginPinch();
       updateCursor(null, null);
-      paint();
+      requestDraw();
       return;
     }
     if (!pointer || (e && pointer.id !== e.pointerId)) return;
@@ -1348,10 +1412,12 @@
       }
     }
     pointer = null;
+    // Leaving a preview remarch: upgrade to full-res on the next draw.
+    if (cache && cache.quality === "preview" && !settle) markGeomDirty();
     const hit = e ? hitTest(e.clientX, e.clientY) : { onLabel: null, mode: "empty" };
     state.hoverLabel = hit.onLabel || null;
     updateCursor(hit, null);
-    paint();
+    requestDraw();
   }
 
   function wheelPixels(delta, mode) {
@@ -1376,7 +1442,7 @@
       cam.zoom = clamp(cam.zoom * Math.exp(-dy * 0.00115), ZOOM_MIN, ZOOM_MAX);
       clampPan();
     }
-    paint();
+    requestDraw();
   }, { passive: false });
 
   canvas.addEventListener("pointerup", endPointer);
@@ -1408,9 +1474,9 @@
     if (keep.length === 1) state.selected.clear();
     state.peaks = keep;
     if (!kept.has(state.activeId)) state.activeId = keep[keep.length - 1].id;
-    state.geomDirty = true;
+    markGeomDirty();
     state.hoverLabel = null;
-    paint();
+    requestDraw();
   }
 
   window.addEventListener("keydown", (e) => {
@@ -1485,7 +1551,7 @@
       state.selected.clear();
       state.picked = true;
       state.hoverLabel = null;
-      state.geomDirty = true;
+      markGeomDirty();
       pointer = null;
       settle = null;
       fingers.clear();
@@ -1508,7 +1574,7 @@
       state.selected.clear();
       state.picked = true;
       state.hoverLabel = null;
-      state.geomDirty = true;
+      markGeomDirty();
       pointer = null;
       settle = null;
       paint();
